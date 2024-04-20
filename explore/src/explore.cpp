@@ -57,6 +57,8 @@ Explore::Explore()
   , move_base_client_("move_base")
   , prev_distance_(0)
   , last_markers_count_(0)
+  , target_detected_(false)
+  , target_reached_(false)
 {
   double timeout;
   double min_frontier_size;
@@ -85,11 +87,37 @@ Explore::Explore()
   exploring_timer_ =
       relative_nh_.createTimer(ros::Duration(1. / planner_frequency_),
                                [this](const ros::TimerEvent&) { makePlan(); });
+
+  target_sub_ = private_nh_.subscribe("/detected_target", 1, &Explore::targetCallback, this);
+  target_reached_sub_ = private_nh_.subscribe("/target_reached", 1, &Explore::targetReachedCallback, this);
+  restart_explore_sub_ = private_nh_.subscribe("/restart_explore", 1, &Explore::restartExploreCallback, this);
+
 }
 
 Explore::~Explore()
 {
   stop();
+}
+
+void Explore::targetCallback(const geometry_msgs::PointStamped::ConstPtr& msg)
+{
+  target_detected_ = true;
+  target_position_ = msg->point;
+}
+
+void Explore::targetReachedCallback(const std_msgs::Bool::ConstPtr& msg)
+{
+  target_reached_ = msg->data;
+  targetReached();
+  target_reached_ = false;
+}
+
+void Explore::restartExploreCallback(const std_msgs::Bool::ConstPtr& msg)
+{
+  if (msg->data) {
+    ROS_INFO("Received restart_explore request, start exploring");
+    start();
+  }
 }
 
 void Explore::visualizeFrontiers(
@@ -230,18 +258,46 @@ void Explore::makePlan()
     return;
   }
 
-  // send goal to move_base if we have something new to pursue
-  move_base_msgs::MoveBaseGoal goal;
-  goal.target_pose.pose.position = target_position;
-  goal.target_pose.pose.orientation.w = 1.;
-  goal.target_pose.header.frame_id = costmap_client_.getGlobalFrameID();
-  goal.target_pose.header.stamp = ros::Time::now();
-  move_base_client_.sendGoal(
-      goal, [this, target_position](
-                const actionlib::SimpleClientGoalState& status,
-                const move_base_msgs::MoveBaseResultConstPtr& result) {
-        reachedGoal(status, result, target_position);
-      });
+  // // send goal to move_base if we have something new to pursue
+  // move_base_msgs::MoveBaseGoal goal;
+  // goal.target_pose.pose.position = target_position;
+  // goal.target_pose.pose.orientation.w = 1.;
+  // goal.target_pose.header.frame_id = costmap_client_.getGlobalFrameID();
+  // goal.target_pose.header.stamp = ros::Time::now();
+  // move_base_client_.sendGoal(
+  //     goal, [this, target_position](
+  //               const actionlib::SimpleClientGoalState& status,
+  //               const move_base_msgs::MoveBaseResultConstPtr& result) {
+  //       reachedGoal(status, result, target_position);
+  //     });
+
+  if (target_detected_) {
+    move_base_msgs::MoveBaseGoal goal;
+    goal.target_pose.header.frame_id = costmap_client_.getGlobalFrameID();
+    goal.target_pose.header.stamp = ros::Time::now();
+    goal.target_pose.pose.position = target_position_;
+    goal.target_pose.pose.orientation.w = 1.0;
+    move_base_client_.sendGoal(
+        goal, [this, target_position](
+                  const actionlib::SimpleClientGoalState& status,
+                  const move_base_msgs::MoveBaseResultConstPtr& result) {
+          reachedGoal(status, result, target_position);
+        });
+    target_detected_ = false;
+  } else {
+    // send goal to move_base if we have something new to pursue
+    move_base_msgs::MoveBaseGoal goal;
+    goal.target_pose.pose.position = target_position;
+    goal.target_pose.pose.orientation.w = 1.;
+    goal.target_pose.header.frame_id = costmap_client_.getGlobalFrameID();
+    goal.target_pose.header.stamp = ros::Time::now();
+    move_base_client_.sendGoal(
+        goal, [this, target_position](
+                  const actionlib::SimpleClientGoalState& status,
+                  const move_base_msgs::MoveBaseResultConstPtr& result) {
+          reachedGoal(status, result, target_position);
+        });
+  }
 }
 
 bool Explore::goalOnBlacklist(const geometry_msgs::Point& goal)
@@ -265,19 +321,41 @@ void Explore::reachedGoal(const actionlib::SimpleClientGoalState& status,
                           const move_base_msgs::MoveBaseResultConstPtr&,
                           const geometry_msgs::Point& frontier_goal)
 {
-  ROS_DEBUG("Reached goal with status: %s", status.toString().c_str());
-  if (status == actionlib::SimpleClientGoalState::ABORTED) {
-    frontier_blacklist_.push_back(frontier_goal);
-    ROS_DEBUG("Adding current goal to black list");
+  // ROS_DEBUG("Reached goal with status: %s", status.toString().c_str());
+  // if (status == actionlib::SimpleClientGoalState::ABORTED) {
+  //   frontier_blacklist_.push_back(frontier_goal);
+  //   ROS_DEBUG("Adding current goal to black list");
+  // }
+
+  // // find new goal immediatelly regardless of planning frequency.
+  // // execute via timer to prevent dead lock in move_base_client (this is
+  // // callback for sendGoal, which is called in makePlan). the timer must live
+  // // until callback is executed.
+  // oneshot_ = relative_nh_.createTimer(
+  //     ros::Duration(0, 0), [this](const ros::TimerEvent&) { makePlan(); },
+  //     true);
+  if (frontier_goal == target_position_) {
+    if (status == actionlib::SimpleClientGoalState::ABORTED) {
+      ROS_INFO("Failed to reach target position, wait for target_reached signal");
+    } else if (status == actionlib::SimpleClientGoalState::SUCCEEDED) {
+      ROS_INFO("Reached target position according to move_base, wait for target_reached signal");
+    }
+  } else {
+    ROS_DEBUG("Reached goal with status: %s", status.toString().c_str());
+    if (status == actionlib::SimpleClientGoalState::ABORTED) {
+      frontier_blacklist_.push_back(frontier_goal);
+      ROS_DEBUG("Adding current goal to black list");
+    }
+
+    // find new goal immediatelly regardless of planning frequency.
+    // execute via timer to prevent dead lock in move_base_client (this is
+    // callback for sendGoal, which is called in makePlan). the timer must live
+    // until callback is executed.
+    oneshot_ = relative_nh_.createTimer(
+        ros::Duration(0, 0), [this](const ros::TimerEvent&) { makePlan(); },
+        true);
   }
 
-  // find new goal immediatelly regardless of planning frequency.
-  // execute via timer to prevent dead lock in move_base_client (this is
-  // callback for sendGoal, which is called in makePlan). the timer must live
-  // until callback is executed.
-  oneshot_ = relative_nh_.createTimer(
-      ros::Duration(0, 0), [this](const ros::TimerEvent&) { makePlan(); },
-      true);
 }
 
 void Explore::start()
@@ -290,6 +368,12 @@ void Explore::stop()
   move_base_client_.cancelAllGoals();
   exploring_timer_.stop();
   ROS_INFO("Exploration stopped.");
+}
+
+void Explore::targetReached()
+{
+  ROS_INFO("Target reached, stop exploring");
+  stop();
 }
 
 }  // namespace explore

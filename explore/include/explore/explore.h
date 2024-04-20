@@ -51,6 +51,8 @@
 #include <explore/costmap_client.h>
 #include <explore/frontier_search.h>
 
+#include <std_msgs/Bool.h>
+
 namespace explore
 {
 /**
@@ -108,6 +110,22 @@ private:
   double potential_scale_, orientation_scale_, gain_scale_;
   ros::Duration progress_timeout_;
   bool visualize_;
+
+  // Subsribe the /detected_target topic
+  ros::Subscriber target_sub_;
+  void targetCallback(const geometry_msgs::PointStamped::ConstPtr& msg);
+  bool target_detected_;
+  geometry_msgs::Point target_position_;
+
+  // Subscribe the /target_reached topic
+  ros::Subscriber target_reached_sub_;
+  bool target_reached_;
+  void targetReachedCallback(const std_msgs::Bool::ConstPtr& msg);
+  void targetReached();
+
+  // Subscribe external trigger to start exploring
+  ros::Subscriber restart_explore_sub_;
+  void restartExploreCallback(const std_msgs::Bool::ConstPtr& msg);
 };
 }
 
